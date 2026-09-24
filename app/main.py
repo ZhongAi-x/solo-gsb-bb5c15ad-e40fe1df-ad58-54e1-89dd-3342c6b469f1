@@ -67,6 +67,10 @@ class RunChoice(BaseModel):
     option_id: str
 
 
+class ShareResume(BaseModel):
+    resume_token: str
+
+
 class RouteOptionRef(BaseModel):
     node_id: str
     option_id: str
@@ -424,6 +428,49 @@ def get_share(token: str):
             "read_only": True}
 
 
+@app.post("/api/share/{token}/resume")
+def resume_share(token: str, payload: ShareResume):
+    """Resume a paused share answer session with a one-time resume token.
+
+    The resume token is bound to one specific share snapshot and one run; it
+    can only be consumed while opening that very share link (path token must
+    match ``resume_tokens.share_token``). The token is single-use: its ``used``
+    flag flips to 1 atomically with the lookup (a conditional UPDATE), so a
+    repeated or concurrent reuse is rejected. Finished sessions cannot be
+    resumed either; start a new answer instead.
+    """
+    resume_token = (payload.resume_token or "").strip()
+    if not resume_token:
+        raise HTTPException(400, "请输入续答令牌")
+    with get_db() as db:
+        share = db.execute("SELECT 1 FROM shares WHERE token = ?", (token,)).fetchone()
+        if share is None:
+            raise HTTPException(404, "分享链接不存在或已失效")
+        rt = db.execute(
+            "SELECT * FROM resume_tokens WHERE token = ?", (resume_token,)
+        ).fetchone()
+        if rt is None:
+            raise HTTPException(404, "续答令牌不存在，请检查后重新输入")
+        if rt["share_token"] != token:
+            # A token may only ever touch the snapshot it was issued for.
+            raise HTTPException(403, "续答令牌不属于当前分享链接，无法在此使用")
+        if rt["used"]:
+            raise HTTPException(400, "续答令牌已使用，一次性令牌无法再次恢复；请开始新的作答")
+        row = db.execute("SELECT * FROM runs WHERE id = ?", (rt["run_id"],)).fetchone()
+        if row is None:
+            raise HTTPException(404, "原作答会话已不存在，无法恢复")
+        if row["finished"]:
+            raise HTTPException(400, "该访谈已结束，无法续答；请开始新的作答")
+        # Atomic single-use claim: only succeeds while used is still 0.
+        claimed = db.execute(
+            "UPDATE resume_tokens SET used = 1 WHERE token = ? AND used = 0",
+            (resume_token,),
+        ).rowcount
+        if not claimed:
+            raise HTTPException(400, "续答令牌已使用，一次性令牌无法再次恢复；请开始新的作答")
+        return _run_response(db, row)
+
+
 # ---- runtime preview ------------------------------------------------------
 
 def _run_content(db, row) -> dict[str, Any]:
@@ -486,15 +533,20 @@ def _load_run(db, run_id: int):
     return row
 
 
+def _run_response(db, row) -> dict[str, Any]:
+    """Serialize a run row into the API shape (current node + path)."""
+    content = _run_content(db, row)
+    node = next((n for n in content["nodes"] if n["id"] == row["current_node_id"]), None)
+    steps = json.loads(row["steps"])
+    return {"run_id": row["id"], "current_node": node, "steps": steps,
+            "finished": bool(row["finished"])}
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: int):
     with get_db() as db:
         row = _load_run(db, run_id)
-        content = _run_content(db, row)
-        node = next((n for n in content["nodes"] if n["id"] == row["current_node_id"]), None)
-        steps = json.loads(row["steps"])
-    return {"run_id": run_id, "current_node": node, "steps": steps,
-            "finished": bool(row["finished"])}
+        return _run_response(db, row)
 
 
 @app.post("/api/runs/{run_id}/choice")
@@ -540,7 +592,45 @@ def restart_run(run_id: int):
         finished = bool(node.get("terminal")) or not node.get("options")
         db.execute("UPDATE runs SET current_node_id = ?, steps = ?, finished = ? WHERE id = ?",
                    (node["id"], json.dumps(steps, ensure_ascii=False), int(finished), run_id))
+        # Restart wipes the paused state: outstanding one-time tokens can no
+        # longer restore a path that has been cleared.
+        db.execute("UPDATE resume_tokens SET used = 1 WHERE run_id = ? AND used = 0", (run_id,))
     return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+
+
+@app.post("/api/runs/{run_id}/pause", status_code=201)
+def pause_run(run_id: int):
+    """Mint a one-time resume token at the current (unfinished) node.
+
+    Only answer sessions started from a read-only share link can be paused:
+    the token stores the share snapshot it belongs to and may only be consumed
+    via that snapshot's resume endpoint. A session that has already reached its
+    end cannot be paused (there is nothing left to answer). The interview is
+    not blocked by pausing — the respondent may keep answering; the token just
+    captures the session, which resumes at whatever state it is in when the
+    token is used.
+    """
+    with get_db() as db:
+        row = _load_run(db, run_id)
+        if row["mode"] != "share" or not row["share_token"]:
+            raise HTTPException(400, "只有只读分享链接中的作答会话可以暂停续答")
+        if row["finished"]:
+            raise HTTPException(400, "访谈已结束，无需续答；请重新开始一次作答")
+        share = db.execute("SELECT token FROM shares WHERE token = ?",
+                           (row["share_token"],)).fetchone()
+        if share is None:
+            raise HTTPException(404, "所属分享快照已不存在，无法生成续答令牌")
+        token = secrets.token_urlsafe(16)
+        db.execute(
+            "INSERT INTO resume_tokens (token, run_id, share_token, used, created_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (token, run_id, row["share_token"], now_iso()),
+        )
+        steps = json.loads(row["steps"])
+    answered = sum(1 for s in steps if s.get("option_id"))
+    return {"resume_token": token, "run_id": run_id,
+            "share_token": row["share_token"], "answered": answered,
+            "current_node_id": row["current_node_id"]}
 
 
 # ---- static frontend ------------------------------------------------------

@@ -1325,7 +1325,7 @@ async function openShare() {
   $("#shareLink").value = url;
   $("#shareOpen").onclick = () => window.open(url, "_blank");
   $("#shareCopy").onclick = () => {
-    navigator.clipboard?.writeText(url).then(() => toast("链接已复制"));
+    copyText(url).then((ok) => toast(ok ? "链接已复制" : "复制失败，请手动选择复制"));
   };
   openModal("shareModal");
 }

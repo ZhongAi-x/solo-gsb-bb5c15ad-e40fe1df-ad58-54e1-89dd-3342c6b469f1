@@ -43,5 +43,17 @@ def init_db() -> None:
                 finished        INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL
             );
+
+            -- One-time pause/resume tokens for read-only share answer sessions.
+            -- Each row is bound to exactly one share snapshot (share_token) and
+            -- one run; used=1 flips on the single successful resume.
+            CREATE TABLE IF NOT EXISTS resume_tokens (
+                token       TEXT PRIMARY KEY,
+                run_id      INTEGER NOT NULL,
+                share_token TEXT NOT NULL,
+                used        INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_resume_tokens_run ON resume_tokens(run_id);
             """
         )
