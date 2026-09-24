@@ -67,6 +67,11 @@ class RunChoice(BaseModel):
     option_id: str
 
 
+class ResumeIn(BaseModel):
+    share_token: str
+    resume_token: str
+
+
 class RouteOptionRef(BaseModel):
     node_id: str
     option_id: str
@@ -540,7 +545,78 @@ def restart_run(run_id: int):
         finished = bool(node.get("terminal")) or not node.get("options")
         db.execute("UPDATE runs SET current_node_id = ?, steps = ?, finished = ? WHERE id = ?",
                    (node["id"], json.dumps(steps, ensure_ascii=False), int(finished), run_id))
+        # restarting moves the session back to the start: outstanding pause
+        # tokens would restore a stale mid-way state, so drop them
+        db.execute("DELETE FROM resume_tokens WHERE run_id = ? AND used = 0", (run_id,))
     return {"run_id": run_id, "current_node": node, "steps": steps, "finished": finished}
+
+
+# ---- pause & resume (read-only share answers) ------------------------------
+
+def _run_payload(row, content: dict[str, Any]) -> dict[str, Any]:
+    node = next((n for n in content["nodes"] if n["id"] == row["current_node_id"]), None)
+    return {"run_id": row["id"], "current_node": node, "steps": json.loads(row["steps"]),
+            "finished": bool(row["finished"])}
+
+
+@app.post("/api/runs/{run_id}/pause", status_code=201)
+def pause_run(run_id: int):
+    """Issue a one-time resume token for an unfinished share answer session.
+
+    Only sessions started via a read-only share link can be paused. Issuing a
+    new token supersedes every still-unused token of the same session, so at
+    most one outstanding token ever points at the current paused state.
+    """
+    with get_db() as db:
+        row = _load_run(db, run_id)
+        if row["mode"] != "share":
+            raise HTTPException(400, "仅只读分享作答支持暂停续答")
+        if row["finished"]:
+            raise HTTPException(400, "访谈已结束，无需暂停续答")
+        db.execute("DELETE FROM resume_tokens WHERE run_id = ? AND used = 0", (run_id,))
+        token = secrets.token_urlsafe(16)
+        db.execute(
+            "INSERT INTO resume_tokens (token, run_id, share_token, used, created_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (token, run_id, row["share_token"], now_iso()),
+        )
+    return {"resume_token": token, "run_id": run_id}
+
+
+@app.post("/api/runs/resume")
+def resume_run(payload: ResumeIn):
+    """Restore a paused share answer session with its one-time token.
+
+    The token only ever unlocks the share snapshot it was issued from: the
+    share token in the URL/page must match the token's owning share. Already
+    used tokens and sessions that have since ended are rejected with explicit
+    errors. The token is consumed atomically, so it cannot be redeemed twice.
+    """
+    with get_db() as db:
+        share = db.execute("SELECT token FROM shares WHERE token = ?",
+                           (payload.share_token,)).fetchone()
+        if share is None:
+            raise HTTPException(404, "分享链接不存在或已失效")
+        tok = db.execute("SELECT * FROM resume_tokens WHERE token = ?",
+                         (payload.resume_token,)).fetchone()
+        if tok is None:
+            raise HTTPException(404, "续答令牌不存在或已失效")
+        if tok["share_token"] != payload.share_token:
+            raise HTTPException(403, "续答令牌不属于当前分享链接")
+        if tok["used"]:
+            raise HTTPException(400, "续答令牌已被使用，请在暂停的会话中重新生成")
+        run = db.execute("SELECT * FROM runs WHERE id = ?", (tok["run_id"],)).fetchone()
+        if run is None or run["share_token"] != payload.share_token:
+            raise HTTPException(404, "续答会话不存在")
+        if run["finished"]:
+            raise HTTPException(400, "该会话的访谈已结束，无法续答")
+        content = _run_content(db, run)
+        cur = db.execute("UPDATE resume_tokens SET used = 1, used_at = ? "
+                         "WHERE token = ? AND used = 0",
+                         (now_iso(), payload.resume_token))
+        if cur.rowcount != 1:  # lost a race: someone else consumed it first
+            raise HTTPException(400, "续答令牌已被使用，请在暂停的会话中重新生成")
+        return _run_payload(run, content)
 
 
 # ---- static frontend ------------------------------------------------------

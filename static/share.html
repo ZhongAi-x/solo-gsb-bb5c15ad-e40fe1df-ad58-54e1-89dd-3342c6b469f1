@@ -12,19 +12,70 @@
   <span style="margin-left:auto">此页面为只读快照，无法编辑脚本</span>
 </div>
 <div style="max-width:860px;margin:24px auto;padding:0 16px">
-  <div class="preview-grid" style="grid-template-columns:1fr 240px">
-    <div>
-      <div id="previewCard" style="font-size:15px"></div>
-      <div style="margin-top:12px"><button id="runRestart">↺ 重新开始</button></div>
-    </div>
-    <div>
-      <div class="path-list">
-        <h4>回答路径记录</h4>
-        <div id="runPath"></div>
+
+  <!-- landing: start a new answer or resume a paused one -->
+  <div id="landing" style="display:none">
+    <div class="share-landing">
+      <h3>开始作答</h3>
+      <p class="share-landing-tip">
+        本访谈支持暂停续答：作答中途可随时点击「⏸ 暂停并生成续答令牌」，
+        之后重新打开本链接并输入令牌，即可从暂停处继续作答。
+      </p>
+      <button class="primary" id="startNew">▶ 开始新的作答</button>
+      <div class="share-resume">
+        <label for="resumeInput">已有续答令牌？输入后继续上次作答：</label>
+        <div class="share-link-row">
+          <input id="resumeInput" placeholder="粘贴一次性续答令牌">
+          <button id="resumeGo">继续作答</button>
+        </div>
+        <div class="share-resume-err" id="resumeErr"></div>
       </div>
     </div>
   </div>
+
+  <!-- answering session -->
+  <div id="session" style="display:none">
+    <div class="preview-grid" style="grid-template-columns:1fr 240px">
+      <div>
+        <div id="previewCard" style="font-size:15px"></div>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button id="runRestart">↺ 重新开始</button>
+          <button id="runPause">⏸ 暂停并生成续答令牌</button>
+        </div>
+      </div>
+      <div>
+        <div class="path-list">
+          <h4>回答路径记录</h4>
+          <div id="runPath"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="fatal" style="display:none;margin-top:40px;text-align:center;color:#991b1b"></div>
+</div>
+
+<!-- pause token modal -->
+<div class="modal-mask" id="pauseModal">
+  <div class="modal">
+    <header>暂停成功 · 一次性续答令牌<span class="close" data-close="pauseModal">✕</span></header>
+    <div class="body">
+      <p style="margin:0 0 12px;color:var(--muted);font-size:13px;line-height:1.8">
+        请立即复制并妥善保存以下令牌。之后重新打开本分享链接、在首页输入该令牌，
+        即可恢复本次会话，从当前节点继续作答（已回答的路径会完整保留）。
+      </p>
+      <div class="share-link-row">
+        <input id="pauseToken" readonly>
+        <button id="pauseCopy">复制令牌</button>
+      </div>
+      <ul class="pause-notes">
+        <li>令牌为<b>一次性</b>：成功恢复一次后立即失效；</li>
+        <li>再次暂停会生成新令牌，旧的未使用令牌同时作废；</li>
+        <li>令牌仅对本分享链接有效，且会话结束后不能再续答。</li>
+      </ul>
+    </div>
+    <footer><button data-close="pauseModal">我已保存令牌</button></footer>
+  </div>
 </div>
 
 <script src="/static/common.js"></script>
@@ -32,9 +83,42 @@
   let runId = null;
   const token = new URLSearchParams(location.search).get("token");
 
+  const $ = (s) => document.querySelector(s);
+
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-close]");
+    if (b) closeModal(b.dataset.close);
+  });
+
+  function showView(name) {
+    $("#landing").style.display = name === "landing" ? "block" : "none";
+    $("#session").style.display = name === "session" ? "block" : "none";
+  }
+
+  function copyText(text, okMsg) {
+    const done = () => toast(okMsg);
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+    } else {
+      fallbackCopy(text, done);
+    }
+  }
+
+  function fallbackCopy(text, done) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); done(); }
+    catch { toast("复制失败，请手动选择复制"); }
+    ta.remove();
+  }
+
   function renderRun(r) {
     const node = r.current_node;
-    const card = document.getElementById("previewCard");
+    const card = $("#previewCard");
     if (r.finished || node.terminal || !(node.options || []).length) {
       card.innerHTML = `
         <div class="q-card">
@@ -56,35 +140,90 @@
         </div>`;
       card.querySelectorAll("button[data-oid]").forEach((b) => {
         b.onclick = async () => {
-          const nr = await api(`/api/runs/${runId}/choice`, {
-            method: "POST", body: { option_id: b.dataset.oid } });
-          renderRun(nr);
+          try {
+            const nr = await api(`/api/runs/${runId}/choice`, {
+              method: "POST", body: { option_id: b.dataset.oid } });
+            renderRun(nr);
+          } catch (err) { toast(err.message); }
         };
       });
     }
-    document.getElementById("runPath").innerHTML = r.steps.map((s, i) => `
+    // pausing only makes sense while the interview is still going
+    $("#runPause").style.display = r.finished ? "none" : "";
+    $("#runPath").innerHTML = r.steps.map((s, i) => `
       <div class="path-step">
         ${i + 1}. ${esc(s.title || s.node_id)}
         ${s.answer ? `<div class="ans">↳ 回答：${esc(s.answer)}</div>` : ""}
       </div>`).join("");
   }
 
-  document.getElementById("runRestart").onclick = async () => {
-    if (!runId) return;
-    renderRun(await api(`/api/runs/${runId}/restart`, { method: "POST" }));
-  };
-
-  (async () => {
+  async function startNewRun() {
     try {
-      const share = await api(`/api/share/${token}`);
-      document.title = `${share.name} · 只读访谈`;
-      document.getElementById("shareName").textContent = share.name;
       const r = await api("/api/runs", { method: "POST", body: { share_token: token } });
       runId = r.run_id;
       renderRun(r);
+      showView("session");
+    } catch (err) { toast(err.message); }
+  }
+
+  async function resumeRun() {
+    const input = $("#resumeInput");
+    const errBox = $("#resumeErr");
+    const resumeToken = input.value.trim();
+    errBox.textContent = "";
+    if (!resumeToken) {
+      errBox.textContent = "请输入续答令牌";
+      input.focus();
+      return;
+    }
+    try {
+      const r = await api("/api/runs/resume", {
+        method: "POST", body: { share_token: token, resume_token: resumeToken } });
+      runId = r.run_id;
+      input.value = "";
+      renderRun(r);
+      showView("session");
+      toast("已恢复上次会话，从暂停处继续作答");
     } catch (err) {
-      document.getElementById("fatal").style.display = "block";
-      document.getElementById("fatal").textContent = "无法打开分享：" + err.message;
+      errBox.textContent = err.message;   // 已使用 / 已结束 / 不属于本分享等明确错误
+    }
+  }
+
+  $("#startNew").onclick = startNewRun;
+  $("#resumeGo").onclick = resumeRun;
+  $("#resumeInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") resumeRun();
+  });
+
+  $("#runRestart").onclick = async () => {
+    if (!runId) return;
+    if (!confirm("确定重新开始？当前作答路径将清空，未使用的续答令牌也会失效。")) return;
+    try {
+      renderRun(await api(`/api/runs/${runId}/restart`, { method: "POST" }));
+    } catch (err) { toast(err.message); }
+  };
+
+  $("#runPause").onclick = async () => {
+    if (!runId) return;
+    try {
+      const r = await api(`/api/runs/${runId}/pause`, { method: "POST" });
+      $("#pauseToken").value = r.resume_token;
+      openModal("pauseModal");
+      copyText(r.resume_token, "续答令牌已复制，请妥善保存");
+    } catch (err) { toast(err.message); }
+  };
+  $("#pauseCopy").onclick = () => copyText($("#pauseToken").value, "续答令牌已复制");
+
+  (async () => {
+    try {
+      if (!token) throw new Error("链接缺少 token 参数");
+      const share = await api(`/api/share/${token}`);
+      document.title = `${share.name} · 只读访谈`;
+      $("#shareName").textContent = share.name;
+      showView("landing");
+    } catch (err) {
+      $("#fatal").style.display = "block";
+      $("#fatal").textContent = "无法打开分享：" + err.message;
     }
   })();
 </script>

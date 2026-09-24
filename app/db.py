@@ -43,5 +43,15 @@ def init_db() -> None:
                 finished        INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS resume_tokens (
+                token       TEXT PRIMARY KEY,           -- one-time pause/resume token
+                run_id      INTEGER NOT NULL,
+                share_token TEXT NOT NULL,              -- scope: the owning share snapshot
+                used        INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                used_at     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_resume_tokens_run ON resume_tokens(run_id);
             """
         )
